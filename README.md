@@ -10,9 +10,10 @@ PNG, JPEG, WebP, GIF, BMP, TIFF, SVG, ICO
 
 | Tool | Description |
 |------|-------------|
-| `read_image` | Read an image (local or URL) and return Base64 with metadata |
-| `read_image_base64` | Read an image and return only the raw Base64 string |
-| `get_image_info` | Get image metadata (MIME type, size) without the full payload |
+| `read_image` | Read an image (local path or URL) and return image content with metadata |
+| `get_image_info` | Get image metadata (MIME type, size, resolution) without the full payload |
+
+Both tools accept `await_for_seconds` and default to waiting up to `3.0` seconds for a local file or remote URL to become available. Fractional seconds are supported. Remote checks use increasing retry intervals and always make a final request at the deadline before returning an error.
 
 ## Installation
 
@@ -48,6 +49,12 @@ python server.py
 # Read a remote image
 ./mcp_script_wrapper.sh --server vision-bridge read_image path=https://example.com/photo.jpg
 
+# Read a local image and wait up to 0.5 seconds for it to appear
+./mcp_script_wrapper.sh --server vision-bridge read_image path=/path/to/image.png await_for_seconds=0.5
+
 # Get image info only
 ./mcp_script_wrapper.sh --server vision-bridge get_image_info path=/path/to/image.png
+
+# Get remote image info and wait up to 10 seconds before failing
+./mcp_script_wrapper.sh --server vision-bridge get_image_info path=https://example.com/photo.jpg await_for_seconds=10
 ```

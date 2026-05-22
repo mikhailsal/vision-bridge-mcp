@@ -3,6 +3,8 @@
 import base64
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +12,7 @@ import httpx
 from mcp.types import ImageContent, TextContent
 
 from server import (
+    DEFAULT_AWAIT_FOR_SECONDS,
     SUPPORTED_MIME_TYPES,
     build_description,
     get_image_dimensions,
@@ -317,6 +320,72 @@ class TestReadImageTool(unittest.TestCase):
         result = read_image(self.tmp.name)
         self.assertIn(f"{len(MINIMAL_PNG)} bytes", result[0].text)
 
+    def test_waits_for_local_file_to_appear(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delayed_path = os.path.join(tmp_dir, "delayed.png")
+
+            def create_file():
+                time.sleep(0.1)
+                with open(delayed_path, "wb") as handle:
+                    handle.write(MINIMAL_PNG)
+
+            thread = threading.Thread(target=create_file)
+            thread.start()
+            try:
+                result = read_image(delayed_path, await_for_seconds=0.5)
+            finally:
+                thread.join()
+
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[1], ImageContent)
+
+    def test_timeout_when_local_file_never_appears(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing_path = os.path.join(tmp_dir, "missing.png")
+            result = read_image(missing_path, await_for_seconds=0.05)
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("did not appear within 0.05 seconds", result[0].text)
+
+    @patch("server.read_remote_bytes")
+    def test_waits_for_remote_image_to_appear(self, mock_remote):
+        start = time.monotonic()
+
+        def delayed_remote(_):
+            if time.monotonic() - start < 0.1:
+                raise httpx.HTTPStatusError(
+                    "404", request=MagicMock(), response=MagicMock(status_code=404)
+                )
+            return MINIMAL_PNG, "image/png"
+
+        mock_remote.side_effect = delayed_remote
+
+        result = read_image(
+            "https://example.com/delayed.png", await_for_seconds=0.4
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertIsInstance(result[1], ImageContent)
+        self.assertGreaterEqual(mock_remote.call_count, 2)
+
+    @patch("server.read_remote_bytes")
+    def test_timeout_when_remote_image_never_appears(self, mock_remote):
+        mock_remote.side_effect = httpx.HTTPStatusError(
+            "404", request=MagicMock(), response=MagicMock(status_code=404)
+        )
+
+        result = read_image(
+            "https://example.com/missing.png", await_for_seconds=0.05
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("Remote resource did not appear within 0.05 seconds", result[0].text)
+
+    def test_invalid_await_for_seconds_returns_error(self):
+        result = read_image(self.tmp.name, await_for_seconds=-1)
+        self.assertEqual(len(result), 1)
+        self.assertIn("await_for_seconds must be a non-negative number", result[0].text)
+
 
 class TestGetImageInfoTool(unittest.TestCase):
     """Test the get_image_info MCP tool."""
@@ -389,6 +458,72 @@ class TestGetImageInfoTool(unittest.TestCase):
 
         result = get_image_info("https://example.com/missing.jpg")
         self.assertIn("Error:", result[0].text)
+
+    def test_waits_for_local_info_file_to_appear(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delayed_path = os.path.join(tmp_dir, "delayed.png")
+
+            def create_file():
+                time.sleep(0.1)
+                with open(delayed_path, "wb") as handle:
+                    handle.write(MINIMAL_PNG)
+
+            thread = threading.Thread(target=create_file)
+            thread.start()
+            try:
+                result = get_image_info(delayed_path, await_for_seconds=0.5)
+            finally:
+                thread.join()
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("resolution: 1x1", result[0].text)
+
+    def test_timeout_when_local_info_file_never_appears(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing_path = os.path.join(tmp_dir, "missing.png")
+            result = get_image_info(missing_path, await_for_seconds=0.05)
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("did not appear within 0.05 seconds", result[0].text)
+
+    @patch("server.get_remote_image_info_text")
+    def test_waits_for_remote_info_to_appear(self, mock_remote_info):
+        start = time.monotonic()
+
+        def delayed_remote(_):
+            if time.monotonic() - start < 0.1:
+                raise httpx.HTTPStatusError(
+                    "404", request=MagicMock(), response=MagicMock(status_code=404)
+                )
+            return "source: url\nurl: https://example.com/delayed.jpg\nmime_type: image/jpeg\nsize_bytes: 123"
+
+        mock_remote_info.side_effect = delayed_remote
+
+        result = get_image_info(
+            "https://example.com/delayed.jpg", await_for_seconds=0.4
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("source: url", result[0].text)
+        self.assertGreaterEqual(mock_remote_info.call_count, 2)
+
+    @patch("server.get_remote_image_info_text")
+    def test_timeout_when_remote_info_never_appears(self, mock_remote_info):
+        mock_remote_info.side_effect = httpx.HTTPStatusError(
+            "404", request=MagicMock(), response=MagicMock(status_code=404)
+        )
+
+        result = get_image_info(
+            "https://example.com/missing.jpg", await_for_seconds=0.05
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("Remote resource did not appear within 0.05 seconds", result[0].text)
+
+
+class TestDefaultAwaitSeconds(unittest.TestCase):
+    def test_default_wait_is_three_seconds(self):
+        self.assertEqual(DEFAULT_AWAIT_FOR_SECONDS, 3.0)
 
 
 class TestMultipleFormats(unittest.TestCase):

@@ -11,6 +11,7 @@ import base64
 import io
 import mimetypes
 import os
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -19,6 +20,8 @@ from mcp.types import ImageContent, TextContent
 from PIL import Image
 
 mcp = FastMCP("ImageReader")
+
+DEFAULT_AWAIT_FOR_SECONDS = 3.0
 
 SUPPORTED_MIME_TYPES = {
     "image/png",
@@ -44,6 +47,74 @@ EXTENSION_TO_MIME = {
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
 }
+
+
+def normalize_await_for_seconds(await_for_seconds: float) -> float:
+    """Validate and normalize the wait duration argument."""
+    try:
+        seconds = float(await_for_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("await_for_seconds must be a non-negative number.") from exc
+
+    if seconds < 0:
+        raise ValueError("await_for_seconds must be a non-negative number.")
+
+    return seconds
+
+
+def wait_for_local_file(file_path: str, await_for_seconds: float) -> str:
+    """Wait for a local file to appear and return its resolved path."""
+    seconds = normalize_await_for_seconds(await_for_seconds)
+    resolved = os.path.abspath(os.path.expanduser(file_path))
+
+    if os.path.isfile(resolved):
+        return resolved
+
+    deadline = time.monotonic() + seconds
+    poll_interval = 0.05
+
+    while time.monotonic() < deadline:
+        time.sleep(min(poll_interval, deadline - time.monotonic()))
+        if os.path.isfile(resolved):
+            return resolved
+
+    if os.path.isfile(resolved):
+        return resolved
+
+    raise TimeoutError(
+        f"File did not appear within {seconds:g} seconds: {resolved}"
+    )
+
+
+def retry_remote_operation(operation, path: str, await_for_seconds: float):
+    """Retry a remote operation with increasing delays and a mandatory final attempt."""
+    seconds = normalize_await_for_seconds(await_for_seconds)
+    deadline = time.monotonic() + seconds
+    sleep_for = 0.2
+    last_error = None
+
+    while True:
+        try:
+            return operation()
+        except ValueError:
+            raise
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            last_error = exc
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        time.sleep(min(sleep_for, remaining))
+        sleep_for = min(sleep_for * 1.7, 2.0)
+
+    if last_error is not None:
+        raise TimeoutError(
+            f"Remote resource did not appear within {seconds:g} seconds: {path}. "
+            f"Last error: {last_error}"
+        ) from last_error
+
+    raise TimeoutError(f"Remote resource did not appear within {seconds:g} seconds: {path}")
 
 
 def guess_mime_type(path: str) -> str:
@@ -121,24 +192,89 @@ def build_description(path: str, mime_type: str, size_bytes: int,
     return f"Image loaded{dim_str} — {mime_type}, {size_bytes} bytes, source: {path}"
 
 
+def get_local_image_info_text(path: str) -> str:
+    """Build metadata text for a local image path."""
+    resolved = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"File not found: {resolved}")
+
+    mime_type = guess_mime_type(resolved)
+    size = os.path.getsize(resolved)
+
+    dimensions = None
+    try:
+        with open(resolved, "rb") as f:
+            dimensions = get_image_dimensions(f.read())
+    except Exception:
+        pass
+
+    dim_str = f"\nresolution: {dimensions[0]}x{dimensions[1]}" if dimensions else ""
+    return (
+        f"source: local\n"
+        f"path: {resolved}\n"
+        f"mime_type: {mime_type}\n"
+        f"size_bytes: {size}"
+        f"{dim_str}"
+    )
+
+
+def get_remote_image_info_text(path: str) -> str:
+    """Build metadata text for a remote image URL."""
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        head_resp = client.head(path, headers={"User-Agent": "ImageReader-MCP/1.0"})
+        head_resp.raise_for_status()
+
+        content_type = head_resp.headers.get("content-type", "")
+        mime_type = content_type.split(";")[0].strip().lower()
+        if mime_type not in SUPPORTED_MIME_TYPES:
+            mime_type = guess_mime_type(urlparse(path).path)
+
+        content_length = head_resp.headers.get("content-length", "unknown")
+
+        dimensions = None
+        try:
+            get_resp = client.get(path, headers={"User-Agent": "ImageReader-MCP/1.0"})
+            get_resp.raise_for_status()
+            dimensions = get_image_dimensions(get_resp.content)
+        except Exception:
+            pass
+
+    dim_str = f"\nresolution: {dimensions[0]}x{dimensions[1]}" if dimensions else ""
+    return (
+        f"source: url\n"
+        f"url: {path}\n"
+        f"mime_type: {mime_type}\n"
+        f"size_bytes: {content_length}"
+        f"{dim_str}"
+    )
+
+
 @mcp.tool()
-def read_image(path: str) -> list[TextContent | ImageContent]:
+def read_image(
+    path: str,
+    await_for_seconds: float = DEFAULT_AWAIT_FOR_SECONDS,
+) -> list[TextContent | ImageContent]:
     """Read an image from a local file path or URL and return it for LLM vision.
 
     Supports PNG, JPEG, WebP, GIF, BMP, TIFF, SVG, and ICO formats.
     For local files, provide the absolute or relative file path.
     For remote images, provide the full HTTP/HTTPS URL.
+    Missing local or remote resources are awaited for up to the configured time.
 
     Returns the image in native MCP format (text description + image content).
 
     Args:
         path: Local file path or HTTP/HTTPS URL of the image to read.
+        await_for_seconds: Seconds to wait for the image to appear before returning an error. Defaults to 3.0.
     """
     try:
         if is_url(path):
-            data, mime_type = read_remote_bytes(path)
+            data, mime_type = retry_remote_operation(
+                lambda: read_remote_bytes(path), path, await_for_seconds
+            )
         else:
-            data, mime_type = read_local_bytes(path)
+            resolved = wait_for_local_file(path, await_for_seconds)
+            data, mime_type = read_local_bytes(resolved)
 
         b64 = base64.b64encode(data).decode("ascii")
         dimensions = get_image_dimensions(data)
@@ -148,7 +284,7 @@ def read_image(path: str) -> list[TextContent | ImageContent]:
             TextContent(type="text", text=description),
             ImageContent(type="image", data=b64, mimeType=mime_type),
         ]
-    except (FileNotFoundError, ValueError) as e:
+    except (FileNotFoundError, TimeoutError, ValueError) as e:
         return [TextContent(type="text", text=f"Error: {e}")]
     except httpx.HTTPStatusError as e:
         return [TextContent(type="text", text=f"Error: HTTP {e.response.status_code} when fetching {path}")]
@@ -157,7 +293,10 @@ def read_image(path: str) -> list[TextContent | ImageContent]:
 
 
 @mcp.tool()
-def get_image_info(path: str) -> list[TextContent]:
+def get_image_info(
+    path: str,
+    await_for_seconds: float = DEFAULT_AWAIT_FOR_SECONDS,
+) -> list[TextContent]:
     """Get metadata about an image without returning the full image data.
 
     Returns the MIME type, file size, and resolution. Useful for checking
@@ -165,67 +304,19 @@ def get_image_info(path: str) -> list[TextContent]:
 
     Args:
         path: Local file path or HTTP/HTTPS URL of the image to inspect.
+        await_for_seconds: Seconds to wait for the image to appear before returning an error. Defaults to 3.0.
     """
     try:
         if is_url(path):
-            # First try HEAD for size, then GET for resolution
-            with httpx.Client(timeout=30, follow_redirects=True) as client:
-                head_resp = client.head(
-                    path, headers={"User-Agent": "ImageReader-MCP/1.0"}
-                )
-                head_resp.raise_for_status()
-
-            content_type = head_resp.headers.get("content-type", "")
-            mime_type = content_type.split(";")[0].strip().lower()
-            if mime_type not in SUPPORTED_MIME_TYPES:
-                mime_type = guess_mime_type(urlparse(path).path)
-
-            content_length = head_resp.headers.get("content-length", "unknown")
-
-            # Try to get dimensions by downloading the image
-            dimensions = None
-            try:
-                with httpx.Client(timeout=30, follow_redirects=True) as client:
-                    get_resp = client.get(
-                        path, headers={"User-Agent": "ImageReader-MCP/1.0"}
-                    )
-                    get_resp.raise_for_status()
-                dimensions = get_image_dimensions(get_resp.content)
-            except Exception:
-                pass
-
-            dim_str = f"\nresolution: {dimensions[0]}x{dimensions[1]}" if dimensions else ""
-            return [TextContent(type="text", text=(
-                f"source: url\n"
-                f"url: {path}\n"
-                f"mime_type: {mime_type}\n"
-                f"size_bytes: {content_length}"
-                f"{dim_str}"
-            ))]
+            text = retry_remote_operation(
+                lambda: get_remote_image_info_text(path), path, await_for_seconds
+            )
         else:
-            resolved = os.path.abspath(os.path.expanduser(path))
-            if not os.path.isfile(resolved):
-                raise FileNotFoundError(f"File not found: {resolved}")
+            resolved = wait_for_local_file(path, await_for_seconds)
+            text = get_local_image_info_text(resolved)
 
-            mime_type = guess_mime_type(resolved)
-            size = os.path.getsize(resolved)
-
-            dimensions = None
-            try:
-                with open(resolved, "rb") as f:
-                    dimensions = get_image_dimensions(f.read())
-            except Exception:
-                pass
-
-            dim_str = f"\nresolution: {dimensions[0]}x{dimensions[1]}" if dimensions else ""
-            return [TextContent(type="text", text=(
-                f"source: local\n"
-                f"path: {resolved}\n"
-                f"mime_type: {mime_type}\n"
-                f"size_bytes: {size}"
-                f"{dim_str}"
-            ))]
-    except FileNotFoundError as e:
+        return [TextContent(type="text", text=text)]
+    except (FileNotFoundError, TimeoutError) as e:
         return [TextContent(type="text", text=f"Error: {e}")]
     except ValueError as e:
         return [TextContent(type="text", text=f"Error: {e}")]
